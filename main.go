@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,18 @@ type SMBConnection struct {
 	Share   *smb2.Share
 }
 
+type TransferJob struct {
+	SourcePath string
+	FolderName string
+	PhotoDate  time.Time
+}
+
+type TransferError struct {
+	FilePath string
+	Share    string
+	Error    error
+}
+
 var photoExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
@@ -57,6 +70,7 @@ func main() {
 	photoshootName := flag.String("name", "", "Photoshoot name")
 	configPath := flag.String("config", "config.yaml", "Path to SMB config YAML file")
 	timeout := flag.Duration("timeout", 30*time.Second, "SMB connection timeout")
+	workers := flag.Int("workers", 4, "Number of parallel workers for file transfers")
 	flag.Parse()
 
 	if *mountPoint == "" || *photoshootName == "" {
@@ -103,12 +117,23 @@ func main() {
 	defer closeConnections(connections)
 
 	// Process photos
-	if err := processPhotos(ctx, *mountPoint, folderName, connections); err != nil {
+	transferErrors, err := processPhotos(ctx, *mountPoint, folderName, connections, *workers)
+	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("Photo transfer cancelled by user")
 			os.Exit(130)
 		}
 		slog.Error("Failed to process photos", "error", err)
+		os.Exit(1)
+	}
+
+	// Print summary
+	if len(transferErrors) > 0 {
+		slog.Warn("Transfer completed with errors", "failed_count", len(transferErrors))
+		fmt.Println("\n=== Transfer Error Summary ===")
+		for _, te := range transferErrors {
+			fmt.Printf("File: %s\n  Share: %s\n  Error: %v\n\n", te.FilePath, te.Share, te.Error)
+		}
 		os.Exit(1)
 	}
 
@@ -185,10 +210,56 @@ func closeConnections(connections []*SMBConnection) {
 	}
 }
 
-func processPhotos(ctx context.Context, mountPoint, folderName string, connections []*SMBConnection) error {
-	slog.Info("Scanning mount point for photos", "path", mountPoint)
-	// Walk through mount point and collect photo files
-	return filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
+func processPhotos(ctx context.Context, mountPoint, folderName string, connections []*SMBConnection, workers int) ([]TransferError, error) {
+	slog.Info("Scanning mount point for photos", "path", mountPoint, "workers", workers)
+
+	// Create channels
+	jobs := make(chan TransferJob)
+	tfChan := make(chan TransferError, workers)
+	var wg sync.WaitGroup
+
+	// Start worker pool
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for job := range jobs {
+				// Check for cancellation
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Transfer to all SMB shares
+				for i, conn := range connections {
+					if err := transferToSMB(job.SourcePath, job.FolderName, job.PhotoDate, conn); err != nil {
+						slog.Error("Failed to transfer to SMB share", "file", job.SourcePath, "share_index", i, "host", conn.Config.Host, "error", err)
+						tfChan <- TransferError{
+							FilePath: job.SourcePath,
+							Share:    fmt.Sprintf("%s/%s", conn.Config.Host, conn.Config.Share),
+							Error:    err,
+						}
+					} else {
+						slog.Info("Successfully transferred to SMB share", "file", filepath.Base(job.SourcePath), "share_index", i, "host", conn.Config.Host)
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Start error collector
+	var transferErrors []TransferError
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for e := range tfChan {
+			transferErrors = append(transferErrors, e)
+		}
+	}()
+
+	// Walk directory and queue jobs
+	walkErr := filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
 		// Check for cancellation
 		select {
 		case <-ctx.Done():
@@ -220,17 +291,34 @@ func processPhotos(ctx context.Context, mountPoint, folderName string, connectio
 			photoDate = info.ModTime()
 		}
 
-		// Transfer to all SMB shares
-		for i, conn := range connections {
-			if err := transferToSMB(path, folderName, photoDate, conn); err != nil {
-				slog.Error("Failed to transfer to SMB share", "share_index", i, "host", conn.Config.Host, "error", err)
-			} else {
-				slog.Info("Successfully transferred to SMB share", "share_index", i, "host", conn.Config.Host)
-			}
+		// Queue the job (blocks when all workers are busy - backpressure)
+		select {
+		case jobs <- TransferJob{
+			SourcePath: path,
+			FolderName: folderName,
+			PhotoDate:  photoDate,
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 
 		return nil
 	})
+
+	// Close jobs channel and
+	close(jobs)
+
+	// Close tfChan channel
+	close(tfChan)
+
+	// wait for workers and wait for collector
+	wg.Wait()
+
+	if walkErr != nil {
+		return transferErrors, walkErr
+	}
+
+	return transferErrors, nil
 }
 
 func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
