@@ -91,6 +91,11 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
+	// Expand environment variables in passwords
+	for i := range config.SMBShares {
+		config.SMBShares[i].Password = os.ExpandEnv(config.SMBShares[i].Password)
+	}
+
 	return &config, nil
 }
 
