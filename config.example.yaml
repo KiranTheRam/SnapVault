@@ -1,0 +1,14 @@
+smb_shares:
+  - host: "nas.local"
+    port: 445
+    share: "photos"
+    username: "photographer"
+    password: "your-password"
+    base_path: "Photoshoots"
+  
+  - host: "backup-nas.local"
+    port: 445
+    share: "backup"
+    username: "backup-user"
+    password: "backup-password"
+    base_path: "PhotoBackups"
