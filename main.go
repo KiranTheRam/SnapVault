@@ -29,6 +29,12 @@ type Config struct {
 	SMBShares []SMBConfig `yaml:"smb_shares"`
 }
 
+type SMBConnection struct {
+	Config  SMBConfig
+	Session *smb2.Session
+	Share   *smb2.Share
+}
+
 var photoExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
@@ -72,8 +78,16 @@ func main() {
 	folderName := fmt.Sprintf("%d - %s", currentYear, *photoshootName)
 	slog.Info("Starting photo transfer", "folder", folderName, "mount_point", *mountPoint)
 
+	// Establish all SMB connections upfront
+	connections, err := establishConnections(config, *timeout)
+	if err != nil {
+		slog.Error("Failed to establish SMB connections", "error", err)
+		os.Exit(1)
+	}
+	defer closeConnections(connections)
+
 	// Process photos
-	if err := processPhotos(*mountPoint, folderName, config, *timeout); err != nil {
+	if err := processPhotos(*mountPoint, folderName, connections); err != nil {
 		slog.Error("Failed to process photos", "error", err)
 		os.Exit(1)
 	}
@@ -100,7 +114,51 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func processPhotos(mountPoint, folderName string, config *Config, timeout time.Duration) error {
+func establishConnections(config *Config, timeout time.Duration) ([]*SMBConnection, error) {
+	connections := make([]*SMBConnection, 0, len(config.SMBShares))
+
+	for i, smbConfig := range config.SMBShares {
+		slog.Info("Establishing SMB connection", "index", i, "host", smbConfig.Host, "share", smbConfig.Share)
+		
+		session, err := connectSMB(smbConfig, timeout)
+		if err != nil {
+			// Clean up already established connections
+			closeConnections(connections)
+			return nil, fmt.Errorf("connecting to share %d (%s): %w", i, smbConfig.Host, err)
+		}
+
+		share, err := session.Mount(smbConfig.Share)
+		if err != nil {
+			session.Logoff()
+			// Clean up already established connections
+			closeConnections(connections)
+			return nil, fmt.Errorf("mounting share %d (%s/%s): %w", i, smbConfig.Host, smbConfig.Share, err)
+		}
+
+		connections = append(connections, &SMBConnection{
+			Config:  smbConfig,
+			Session: session,
+			Share:   share,
+		})
+		slog.Info("Successfully connected to SMB share", "index", i, "host", smbConfig.Host)
+	}
+
+	return connections, nil
+}
+
+func closeConnections(connections []*SMBConnection) {
+	for i, conn := range connections {
+		if conn.Share != nil {
+			slog.Info("Unmounting share", "index", i, "host", conn.Config.Host)
+			conn.Share.Umount()
+		}
+		if conn.Session != nil {
+			conn.Session.Logoff()
+		}
+	}
+}
+
+func processPhotos(mountPoint, folderName string, connections []*SMBConnection) error {
 	slog.Info("Scanning mount point for photos", "path", mountPoint)
 	// Walk through mount point and collect photo files
 	return filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
@@ -129,11 +187,11 @@ func processPhotos(mountPoint, folderName string, config *Config, timeout time.D
 		}
 
 		// Transfer to all SMB shares
-		for i, smbConfig := range config.SMBShares {
-			if err := transferToSMB(path, folderName, photoDate, smbConfig, timeout); err != nil {
-				slog.Error("Failed to transfer to SMB share", "share_index", i, "host", smbConfig.Host, "error", err)
+		for i, conn := range connections {
+			if err := transferToSMB(path, folderName, photoDate, conn); err != nil {
+				slog.Error("Failed to transfer to SMB share", "share_index", i, "host", conn.Config.Host, "error", err)
 			} else {
-				slog.Info("Successfully transferred to SMB share", "share_index", i, "host", smbConfig.Host)
+				slog.Info("Successfully transferred to SMB share", "share_index", i, "host", conn.Config.Host)
 			}
 		}
 
@@ -164,27 +222,13 @@ func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
 	return tm, nil
 }
 
-func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SMBConfig, timeout time.Duration) error {
-	slog.Info("Connecting to SMB share", "host", config.Host, "share", config.Share)
-	conn, err := connectSMB(config, timeout)
-	if err != nil {
-		return fmt.Errorf("connecting to SMB: %w", err)
-	}
-	defer conn.Logoff()
-
-	slog.Info("Mounting share", "share", config.Share)
-	fs, err := conn.Mount(config.Share)
-	if err != nil {
-		return fmt.Errorf("mounting share: %w", err)
-	}
-	defer fs.Umount()
-
+func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMBConnection) error {
 	// Create folder structure: basePath/folderName/YYYY-MM-DD/
 	dateFolder := photoDate.Format("2006-01-02")
-	destDir := filepath.Join(config.BasePath, folderName, dateFolder)
+	destDir := filepath.Join(conn.Config.BasePath, folderName, dateFolder)
 
 	slog.Info("Creating destination directory", "path", destDir)
-	if err := mkdirAllSMB(fs, destDir); err != nil {
+	if err := mkdirAllSMB(conn.Share, destDir); err != nil {
 		return fmt.Errorf("creating directories: %w", err)
 	}
 
@@ -193,7 +237,7 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SM
 	destPath := filepath.Join(destDir, fileName)
 
 	slog.Info("Copying file to SMB", "source", fileName, "destination", destPath)
-	if err := copyFileToSMB(sourcePath, fs, destPath); err != nil {
+	if err := copyFileToSMB(sourcePath, conn.Share, destPath); err != nil {
 		return fmt.Errorf("copying file: %w", err)
 	}
 
