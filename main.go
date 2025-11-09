@@ -95,6 +95,7 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func processPhotos(mountPoint, folderName string, config *Config) error {
+	slog.Info("Scanning mount point for photos", "path", mountPoint)
 	// Walk through mount point and collect photo files
 	return filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -158,13 +159,14 @@ func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
 }
 
 func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SMBConfig) error {
-	// Connect to SMB share
+	slog.Info("Connecting to SMB share", "host", config.Host, "share", config.Share)
 	conn, err := connectSMB(config)
 	if err != nil {
 		return fmt.Errorf("connecting to SMB: %w", err)
 	}
 	defer conn.Logoff()
 
+	slog.Info("Mounting share", "share", config.Share)
 	fs, err := conn.Mount(config.Share)
 	if err != nil {
 		return fmt.Errorf("mounting share: %w", err)
@@ -175,7 +177,7 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SM
 	dateFolder := photoDate.Format("2006-01-02")
 	destDir := filepath.Join(config.BasePath, folderName, dateFolder)
 
-	// Create directories recursively
+	slog.Info("Creating destination directory", "path", destDir)
 	if err := mkdirAllSMB(fs, destDir); err != nil {
 		return fmt.Errorf("creating directories: %w", err)
 	}
@@ -184,6 +186,7 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SM
 	fileName := filepath.Base(sourcePath)
 	destPath := filepath.Join(destDir, fileName)
 
+	slog.Info("Copying file to SMB", "source", fileName, "destination", destPath)
 	if err := copyFileToSMB(sourcePath, fs, destPath); err != nil {
 		return fmt.Errorf("copying file: %w", err)
 	}
