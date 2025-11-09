@@ -17,7 +17,8 @@ import requests
 import json
 import logging
 from tqdm import tqdm
-
+import urllib.parse
+import time
 
 class DiscordNotifier:
     """Handle Discord webhook notifications"""
@@ -131,10 +132,8 @@ def load_config():
         'nas_storage_path': os.getenv('NAS_STORAGE_PATH', ''),
         'nas_editing_share': os.getenv('NAS_EDITING_SHARE'),
         'nas_editing_path': os.getenv('NAS_EDITING_PATH', ''),
-        'temp_dir': os.getenv('TEMP_DIR', '/tmp/photo_import'),
-        'mount_base': os.getenv('MOUNT_BASE', '/Volumes'),
-        'discord_webhook': os.getenv('DISCORD_WEBHOOK_URL'),
-        'log_dir': os.getenv('LOG_DIR', 'logs')
+        'log_dir': os.getenv('LOG_DIR', 'logs'),
+        'discord_webhook': os.getenv('DISCORD_WEBHOOK_URL')
     }
 
     # Validate required fields
@@ -147,70 +146,76 @@ def load_config():
 
     return config
 
-def ensure_mount_clean(mount_point: str):
-    """Ensure mount point is clean before attempting to mount."""
-    try:
-        # Check if the mount point is already in use
-        result = subprocess.run(["mount"], capture_output=True, text=True)
-        if mount_point in result.stdout:
-            logging.warning(f"Mount point {mount_point} already in use. Attempting to unmount...")
-            unmount = subprocess.run(["umount", mount_point], capture_output=True, text=True)
-            if unmount.returncode != 0:
-                logging.warning(f"Unmount failed with: {unmount.stderr.strip()}")
-                # Force unmount as fallback
-                subprocess.run(["umount", "-f", mount_point], stderr=subprocess.DEVNULL)
-                logging.info(f"Forced unmount of {mount_point}")
-
-        # Ensure directory exists
-        if os.path.ismount(mount_point):
-            raise RuntimeError(f"Mount point {mount_point} is still busy after unmount attempt.")
-        os.makedirs(mount_point, exist_ok=True)
-    except Exception as e:
-        logging.error(f"Failed to prepare mount point {mount_point}: {e}")
-        raise
-
-    def mount_smb_share(user: str, password: str, host: str, share: str, mount_point: str):
-        """Mount SMB share after ensuring the mount point is clean."""
-        ensure_mount_clean(mount_point)
-
-        mount_smb_share(user, password, host, share, mount_point)
-
-        if result.returncode != 0:
-            logging.error(f"Failed to mount SMB share: {result.stderr.strip()}")
-            raise RuntimeError(f"SMB mount failed with code {result.returncode}")
 
 def copy_folder_to_smb(source_folder, nas_ip, username, password, share_name, remote_path):
     """
-    Copy a folder to an SMB share by temporarily mounting it and using rsync.
+    Copy a folder to an SMB share by temporarily mounting it (Linux version) and using rsync.
     """
     source_path = Path(source_folder)
     folder_name = source_path.name
     mount_point = Path("/tmp") / f"snapvault_mount_{share_name.replace(' ', '_')}"
 
-    # Ensure mount point exists
+    logging.info(f"Preparing to mount SMB share {share_name} at {mount_point}")
+
+    # Check if mount point already exists and unmount if necessary
+    if mount_point.exists():
+        mount_check = subprocess.run(['mount'], capture_output=True, text=True)
+        if str(mount_point) in mount_check.stdout:
+            logging.info(f"Mount point {mount_point} is already mounted, unmounting first...")
+            try:
+                subprocess.run(['umount', str(mount_point)], check=True, capture_output=True)
+                logging.info("Successfully unmounted existing mount")
+            except subprocess.CalledProcessError:
+                logging.warning("Regular unmount failed, trying lazy unmount...")
+                try:
+                    subprocess.run(['umount', '-l', str(mount_point)], check=True, capture_output=True)
+                    logging.info("Lazy unmount successful")
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Could not unmount {mount_point}: {e}")
+                    return False
+
+        # Try to remove the directory if it exists
+        try:
+            mount_point.rmdir()
+        except OSError:
+            pass
+
+    # Wait for unmount to finalize
+    for _ in range(5):
+        mount_check = subprocess.run(['mount'], capture_output=True, text=True)
+        if str(mount_point) not in mount_check.stdout:
+            break
+        logging.info(f"Waiting for {mount_point} to fully unmount...")
+        time.sleep(1)
+    else:
+        logging.error(f"Mount point {mount_point} still appears mounted after retries.")
+        return False
+
+    if mount_point.exists():
+        try:
+            shutil.rmtree(mount_point)
+        except Exception as e:
+            logging.warning(f"Could not remove stale mount point: {e}")
+
     mount_point.mkdir(parents=True, exist_ok=True)
 
-    logging.info(f"Mounting SMB share {share_name} at {mount_point}")
     print(f"  Mounting {share_name}...")
 
-    # Build SMB mount command (works on macOS; Linux variant below)
+    # Mount command for Linux using CIFS
+    share_path = f"//{nas_ip}/{share_name}"
+
     mount_cmd = [
-        "mount_smbfs",
-        f"//{username}:{password}@{nas_ip}/{share_name}",
-        str(mount_point)
+        "mount", "-t", "cifs", share_path, str(mount_point),
+        "-o", f"username={username},password={password},rw,vers=3.0,nounix,noserverino,iocharset=utf8"
     ]
 
-    # For Linux systems, use this instead:
-    # mount_cmd = [
-    #     "sudo", "mount", "-t", "cifs",
-    #     f"//{nas_ip}/{share_name}", str(mount_point),
-    #     "-o", f"username={username},password={password},rw,iocharset=utf8,file_mode=0777,dir_mode=0777"
-    # ]
+    logging.info(f"Mounting: //{username}:***@{nas_ip}/{share_name}")
 
     try:
-        subprocess.run(mount_cmd, check=True)
+        subprocess.run(mount_cmd, capture_output=True, text=True, check=True)
+        logging.info("SMB share mounted successfully")
     except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to mount SMB share: {e}")
+        logging.error(f"Failed to mount SMB share: {e.stderr}")
         print(f"  ❌ Failed to mount SMB share")
         return False
 
@@ -222,34 +227,71 @@ def copy_folder_to_smb(source_folder, nas_ip, username, password, share_name, re
             dest_path.mkdir(parents=True, exist_ok=True)
 
         final_dest = dest_path / folder_name
+
+        if final_dest.exists():
+            logging.warning(f"Destination already exists: {final_dest}")
+            print(f"  ⚠️  Destination folder already exists, skipping...")
+            return True
+
         final_dest.mkdir(exist_ok=True)
 
-        # Now use rsync locally
+        # Rsync for copying
         rsync_cmd = [
-            "rsync", "-av", "--progress",
+            "rsync", "-avh", "--progress",
             str(source_path) + "/", str(final_dest) + "/"
         ]
 
-        logging.info(f"Running: {' '.join(rsync_cmd)}")
-        process = subprocess.run(rsync_cmd, capture_output=True, text=True)
+        logging.info(f"Running rsync: rsync -avh --progress <source> <dest>")
+        print(f"  Copying files...")
+
+        process = subprocess.Popen(
+            rsync_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+            line = line.strip()
+            if line:
+                if 'to-check' in line or '%' in line:
+                    print(f"  {line}", end='\r')
+
+        process.wait()
+        stderr = process.stderr.read()
 
         if process.returncode == 0:
             logging.info("Rsync completed successfully")
-            print(f"  ✓ Transfer complete")
+            print(f"  ✓ Transfer complete" + " " * 50)
             return True
         else:
-            logging.error(f"Rsync failed: {process.stderr}")
-            print(f"  ❌ Transfer failed: {process.stderr}")
+            logging.error(f"Rsync failed: {stderr}")
+            print(f"  ❌ Transfer failed: {stderr}")
             return False
 
+    except Exception as e:
+        logging.error(f"Copy operation failed: {e}")
+        print(f"  ❌ Copy failed: {e}")
+        return False
+
     finally:
-        # Always unmount the SMB share
         print(f"  Unmounting {share_name}...")
         try:
-            subprocess.run(["umount", str(mount_point)], check=True)
+            subprocess.run(["umount", str(mount_point)], check=True, capture_output=True)
+            logging.info(f"Unmounted {mount_point}")
             mount_point.rmdir()
-        except Exception as e:
+        except subprocess.CalledProcessError as e:
             logging.warning(f"Could not unmount {share_name}: {e}")
+            try:
+                subprocess.run(["umount", "-l", str(mount_point)], capture_output=True)
+                mount_point.rmdir()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning(f"Cleanup error: {e}")
 
 
 
@@ -355,7 +397,7 @@ def organize_photos(source_dir, dest_dir, folder_name):
 
 
 def copy_to_destinations(source_folder, config, destination_filter='both'):
-    """Copy the organized folder to NAS destinations via SMB (direct copy, no mounting)"""
+    """Copy the organized folder to NAS destinations via SMB"""
     folder_name = source_folder.name
 
     print(f"\n📤 Copying to NAS destinations...")
@@ -509,7 +551,7 @@ def main():
         if not organized_folder:
             raise Exception("Failed to organize photos - no images found")
 
-        # Copy to both NAS locations via rsync
+        # Copy to NAS locations
         copy_to_destinations(organized_folder, config, args.destination)
 
         # Calculate duration
