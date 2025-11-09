@@ -35,9 +35,10 @@ type Config struct {
 }
 
 type SMBConnection struct {
-	Config  SMBConfig
-	Session *smb2.Session
-	Share   *smb2.Share
+	Config      SMBConfig
+	Session     *smb2.Session
+	Share       *smb2.Share
+	createdDirs sync.Map // Cache of created directory paths
 }
 
 type TransferJob struct {
@@ -187,11 +188,12 @@ func establishConnections(ctx context.Context, config *Config, timeout time.Dura
 			return nil, fmt.Errorf("mounting share %d (%s/%s): %w", i, smbConfig.Host, smbConfig.Share, err)
 		}
 
-		connections = append(connections, &SMBConnection{
+		conn := &SMBConnection{
 			Config:  smbConfig,
 			Session: session,
 			Share:   share,
-		})
+		}
+		connections = append(connections, conn)
 		slog.Info("Successfully connected to SMB share", "index", i, "host", smbConfig.Host)
 	}
 
@@ -349,9 +351,14 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMB
 	dateFolder := photoDate.Format("2006-01-02")
 	destDir := filepath.Join(conn.Config.BasePath, folderName, dateFolder)
 
-	slog.Info("Creating destination directory", "path", destDir)
-	if err := mkdirAllSMB(conn.Share, destDir); err != nil {
-		return fmt.Errorf("creating directories: %w", err)
+	// Check cache first
+	if _, exists := conn.createdDirs.Load(destDir); !exists {
+		slog.Info("Creating destination directory", "path", destDir)
+		if err := mkdirAllSMB(conn.Share, destDir); err != nil {
+			return fmt.Errorf("creating directories: %w", err)
+		}
+		// Cache the successfully created path
+		conn.createdDirs.Store(destDir, struct{}{})
 	}
 
 	// Copy file
@@ -420,15 +427,11 @@ func mkdirAllSMB(fs *smb2.Share, path string) error {
 			currentPath = currentPath + "/" + part
 		}
 
-		// Try to stat the directory
-		_, err := fs.Stat(currentPath)
-		if err != nil {
-			// Directory doesn't exist, create it
-			if err := fs.Mkdir(currentPath, 0755); err != nil {
-				// Check if error is "already exists"
-				if !os.IsExist(err) {
-					return fmt.Errorf("creating directory %s: %w", currentPath, err)
-				}
+		// Try to create the directory (optimistic creation, no stat check)
+		if err := fs.Mkdir(currentPath, 0755); err != nil {
+			// Ignore "already exists" errors
+			if !os.IsExist(err) {
+				return fmt.Errorf("creating directory %s: %w", currentPath, err)
 			}
 		}
 	}
