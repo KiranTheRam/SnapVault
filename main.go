@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hirochachacha/go-smb2"
@@ -78,8 +82,20 @@ func main() {
 	folderName := fmt.Sprintf("%d - %s", currentYear, *photoshootName)
 	slog.Info("Starting photo transfer", "folder", folderName, "mount_point", *mountPoint)
 
+	// Set up context with signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		slog.Info("Received signal, shutting down gracefully", "signal", sig)
+		cancel()
+	}()
+
 	// Establish all SMB connections upfront
-	connections, err := establishConnections(config, *timeout)
+	connections, err := establishConnections(ctx, config, *timeout)
 	if err != nil {
 		slog.Error("Failed to establish SMB connections", "error", err)
 		os.Exit(1)
@@ -87,7 +103,11 @@ func main() {
 	defer closeConnections(connections)
 
 	// Process photos
-	if err := processPhotos(*mountPoint, folderName, connections); err != nil {
+	if err := processPhotos(ctx, *mountPoint, folderName, connections); err != nil {
+		if errors.Is(err, context.Canceled) {
+			slog.Info("Photo transfer cancelled by user")
+			os.Exit(130)
+		}
 		slog.Error("Failed to process photos", "error", err)
 		os.Exit(1)
 	}
@@ -114,13 +134,20 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func establishConnections(config *Config, timeout time.Duration) ([]*SMBConnection, error) {
+func establishConnections(ctx context.Context, config *Config, timeout time.Duration) ([]*SMBConnection, error) {
 	connections := make([]*SMBConnection, 0, len(config.SMBShares))
 
 	for i, smbConfig := range config.SMBShares {
+		select {
+		case <-ctx.Done():
+			closeConnections(connections)
+			return nil, ctx.Err()
+		default:
+		}
+
 		slog.Info("Establishing SMB connection", "index", i, "host", smbConfig.Host, "share", smbConfig.Share)
-		
-		session, err := connectSMB(smbConfig, timeout)
+
+		session, err := connectSMB(ctx, smbConfig, timeout)
 		if err != nil {
 			// Clean up already established connections
 			closeConnections(connections)
@@ -158,10 +185,17 @@ func closeConnections(connections []*SMBConnection) {
 	}
 }
 
-func processPhotos(mountPoint, folderName string, connections []*SMBConnection) error {
+func processPhotos(ctx context.Context, mountPoint, folderName string, connections []*SMBConnection) error {
 	slog.Info("Scanning mount point for photos", "path", mountPoint)
 	// Walk through mount point and collect photo files
 	return filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			slog.Warn("Error accessing path", "path", path, "error", err)
 			return nil // Continue with other files
@@ -244,16 +278,20 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMB
 	return nil
 }
 
-func connectSMB(config SMBConfig, timeout time.Duration) (*smb2.Session, error) {
+func connectSMB(ctx context.Context, config SMBConfig, timeout time.Duration) (*smb2.Session, error) {
 	port := config.Port
 	if port == 0 {
 		port = 445
 	}
 
 	addr := net.JoinHostPort(config.Host, fmt.Sprintf("%d", port))
-	
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.Dial("tcp", addr)
+
+	// Create context with timeout
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %w", err)
 	}
@@ -278,7 +316,7 @@ func connectSMB(config SMBConfig, timeout time.Duration) (*smb2.Session, error) 
 func mkdirAllSMB(fs *smb2.Share, path string) error {
 	// Normalize path separators to forward slashes
 	path = filepath.ToSlash(path)
-	
+
 	// Split path into components
 	parts := strings.Split(path, "/")
 	currentPath := ""
