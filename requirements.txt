@@ -1,4 +1,0 @@
-Pillow
-python-dotenv
-requests
-tqdm
