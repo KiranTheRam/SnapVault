@@ -147,63 +147,110 @@ def load_config():
 
     return config
 
+def ensure_mount_clean(mount_point: str):
+    """Ensure mount point is clean before attempting to mount."""
+    try:
+        # Check if the mount point is already in use
+        result = subprocess.run(["mount"], capture_output=True, text=True)
+        if mount_point in result.stdout:
+            logging.warning(f"Mount point {mount_point} already in use. Attempting to unmount...")
+            unmount = subprocess.run(["umount", mount_point], capture_output=True, text=True)
+            if unmount.returncode != 0:
+                logging.warning(f"Unmount failed with: {unmount.stderr.strip()}")
+                # Force unmount as fallback
+                subprocess.run(["umount", "-f", mount_point], stderr=subprocess.DEVNULL)
+                logging.info(f"Forced unmount of {mount_point}")
 
-def mount_smb_share(nas_ip, username, password, share_name, mount_point):
-    """Mount an SMB share on macOS"""
-    mount_path = Path(mount_point)
+        # Ensure directory exists
+        if os.path.ismount(mount_point):
+            raise RuntimeError(f"Mount point {mount_point} is still busy after unmount attempt.")
+        os.makedirs(mount_point, exist_ok=True)
+    except Exception as e:
+        logging.error(f"Failed to prepare mount point {mount_point}: {e}")
+        raise
 
-    if mount_path.exists() and mount_path.is_mount():
-        logging.info(f"Share already mounted at {mount_path}")
-        return True
+    def mount_smb_share(user: str, password: str, host: str, share: str, mount_point: str):
+        """Mount SMB share after ensuring the mount point is clean."""
+        ensure_mount_clean(mount_point)
 
-    mount_path.mkdir(parents=True, exist_ok=True)
-    smb_url = f"smb://{username}:{password}@{nas_ip}/{share_name}"
+        mount_smb_share(user, password, host, share, mount_point)
 
-    logging.info(f"Mounting {share_name} at {mount_path}")
+        if result.returncode != 0:
+            logging.error(f"Failed to mount SMB share: {result.stderr.strip()}")
+            raise RuntimeError(f"SMB mount failed with code {result.returncode}")
+
+def copy_folder_to_smb(source_folder, nas_ip, username, password, share_name, remote_path):
+    """
+    Copy a folder to an SMB share by temporarily mounting it and using rsync.
+    """
+    source_path = Path(source_folder)
+    folder_name = source_path.name
+    mount_point = Path("/tmp") / f"snapvault_mount_{share_name.replace(' ', '_')}"
+
+    # Ensure mount point exists
+    mount_point.mkdir(parents=True, exist_ok=True)
+
+    logging.info(f"Mounting SMB share {share_name} at {mount_point}")
+    print(f"  Mounting {share_name}...")
+
+    # Build SMB mount command (works on macOS; Linux variant below)
+    mount_cmd = [
+        "mount_smbfs",
+        f"//{username}:{password}@{nas_ip}/{share_name}",
+        str(mount_point)
+    ]
+
+    # For Linux systems, use this instead:
+    # mount_cmd = [
+    #     "sudo", "mount", "-t", "cifs",
+    #     f"//{nas_ip}/{share_name}", str(mount_point),
+    #     "-o", f"username={username},password={password},rw,iocharset=utf8,file_mode=0777,dir_mode=0777"
+    # ]
 
     try:
-        result = subprocess.run(
-            ['mount', '-t', 'smbfs', smb_url, str(mount_path)],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        subprocess.run(mount_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to mount SMB share: {e}")
+        print(f"  ❌ Failed to mount SMB share")
+        return False
 
-        if result.returncode == 0:
-            logging.info(f"Successfully mounted {share_name}")
+    try:
+        # Create destination path inside mounted share
+        dest_path = mount_point
+        if remote_path:
+            dest_path = dest_path / remote_path
+            dest_path.mkdir(parents=True, exist_ok=True)
+
+        final_dest = dest_path / folder_name
+        final_dest.mkdir(exist_ok=True)
+
+        # Now use rsync locally
+        rsync_cmd = [
+            "rsync", "-av", "--progress",
+            str(source_path) + "/", str(final_dest) + "/"
+        ]
+
+        logging.info(f"Running: {' '.join(rsync_cmd)}")
+        process = subprocess.run(rsync_cmd, capture_output=True, text=True)
+
+        if process.returncode == 0:
+            logging.info("Rsync completed successfully")
+            print(f"  ✓ Transfer complete")
             return True
         else:
-            logging.error(f"Mount failed: {result.stderr}")
+            logging.error(f"Rsync failed: {process.stderr}")
+            print(f"  ❌ Transfer failed: {process.stderr}")
             return False
 
-    except subprocess.TimeoutExpired:
-        logging.error(f"Mount timed out for {share_name}")
-        return False
-    except Exception as e:
-        logging.error(f"Mount error: {e}")
-        return False
+    finally:
+        # Always unmount the SMB share
+        print(f"  Unmounting {share_name}...")
+        try:
+            subprocess.run(["umount", str(mount_point)], check=True)
+            mount_point.rmdir()
+        except Exception as e:
+            logging.warning(f"Could not unmount {share_name}: {e}")
 
-
-def unmount_share(mount_point):
-    """Unmount an SMB share"""
-    mount_path = Path(mount_point)
-
-    if not mount_path.exists() or not mount_path.is_mount():
-        return True
-
-    try:
-        result = subprocess.run(
-            ['umount', str(mount_path)],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            logging.info(f"Unmounted {mount_path}")
-        return result.returncode == 0
-    except Exception as e:
-        logging.warning(f"Could not unmount {mount_path}: {e}")
-        return False
 
 
 def get_date_taken(file_path):
@@ -280,6 +327,7 @@ def organize_photos(source_dir, dest_dir, folder_name):
                     dest_file = date_folder / f"{stem}_{counter}{suffix}"
                     counter += 1
 
+                # IMPORTANT: Copy files, never move or delete from source (SD card)
                 shutil.copy2(img_file, dest_file)
                 date_counts[date_str] = date_counts.get(date_str, 0) + 1
 
@@ -307,9 +355,8 @@ def organize_photos(source_dir, dest_dir, folder_name):
 
 
 def copy_to_destinations(source_folder, config, destination_filter='both'):
-    """Copy the organized folder to NAS destinations via SMB"""
+    """Copy the organized folder to NAS destinations via SMB (direct copy, no mounting)"""
     folder_name = source_folder.name
-    mount_base = Path(config['mount_base'])
 
     print(f"\n📤 Copying to NAS destinations...")
     logging.info("Starting NAS copy operations")
@@ -341,44 +388,39 @@ def copy_to_destinations(source_folder, config, destination_filter='both'):
         print(f"\n{idx}️⃣  {dest['name']} ({dest['share']}):")
         logging.info(f"Processing {dest['name']}")
 
-        mount_point = mount_base / dest['share']
-
-        if mount_smb_share(config['nas_ip'], config['nas_username'],
-                           config['nas_password'], dest['share'], mount_point):
-
-            dest_path = mount_point / dest['path'] / folder_name
-            dest_path = dest_path.resolve()
-
-            print(f"  Copying to: {dest_path}")
-
-            if dest_path.exists():
-                logging.warning(f"Destination exists: {dest_path}")
-                print(f"  ⚠️  Destination exists, skipping...")
-            else:
-                try:
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                    # Progress bar for copying
-                    print(f"  Copying files...")
-                    shutil.copytree(source_folder, dest_path)
-
-                    logging.info(f"Successfully copied to {dest_path}")
-                    print(f"  ✓ Copied successfully")
-                except Exception as e:
-                    logging.error(f"Copy failed: {e}")
-                    raise
+        # Construct destination path
+        if dest['path']:
+            remote_path = dest['path']
         else:
-            error_msg = f"Failed to mount {dest['share']}"
-            logging.error(error_msg)
-            raise Exception(error_msg)
+            remote_path = ""
+
+        dest_display = f"//{config['nas_ip']}/{dest['share']}/{remote_path}/{folder_name}".replace("//", "/").replace(
+            ":/", "://")
+        print(f"  Copying to: {dest_display}")
+
+        try:
+            success = copy_folder_to_smb(
+                source_folder,
+                config['nas_ip'],
+                config['nas_username'],
+                config['nas_password'],
+                dest['share'],
+                remote_path
+            )
+
+            if success:
+                logging.info(f"Successfully copied to {dest['share']}")
+                print(f"  ✓ Copied successfully")
+            else:
+                error_msg = f"Failed to copy to {dest['share']}"
+                logging.error(error_msg)
+                raise Exception(error_msg)
+
+        except Exception as e:
+            logging.error(f"Copy failed: {e}")
+            raise
 
     print(f"\n✅ All copies completed!")
-
-    # Unmount shares
-    print(f"\n🔌 Unmounting shares...")
-    for dest in destinations:
-        mount_point = mount_base / dest['share']
-        unmount_share(mount_point)
 
 
 def main():
@@ -453,14 +495,21 @@ def main():
 
     start_time = datetime.now()
 
+    # Create temporary directory in project folder
+    script_dir = Path(__file__).parent
+    temp_dir = script_dir / 'temp_organize'
+    temp_dir.mkdir(exist_ok=True)
+
+    organized_folder = None
+
     try:
-        # Organize photos
-        organized_folder, stats = organize_photos(args.source, config['temp_dir'], folder_name)
+        # Organize photos in local temp directory
+        organized_folder, stats = organize_photos(args.source, temp_dir, folder_name)
 
         if not organized_folder:
             raise Exception("Failed to organize photos - no images found")
 
-        # Copy to both NAS locations via SMB
+        # Copy to both NAS locations via rsync
         copy_to_destinations(organized_folder, config, args.destination)
 
         # Calculate duration
@@ -472,16 +521,6 @@ def main():
 
         # Send success notification
         discord.send_success(folder_name, stats)
-
-        # Ask if user wants to clean up temp folder
-        cleanup = input(f"\n🗑️  Remove temporary files from {organized_folder}? (y/n): ")
-        if cleanup.lower() == 'y':
-            shutil.rmtree(organized_folder)
-            logging.info("Temporary files removed")
-            print("  ✓ Temporary files removed")
-        else:
-            logging.info(f"Temporary files kept at {organized_folder}")
-            print(f"  ℹ️  Temporary files kept at: {organized_folder}")
 
         print("\n✨ Import complete!")
         logging.info("SnapVault completed successfully")
@@ -499,6 +538,25 @@ def main():
 
         # Send error notification
         discord.send_error(folder_name, error_msg, tb)
+
+    finally:
+        # ALWAYS clean up temporary files (but NEVER touch the SD card source)
+        if organized_folder and organized_folder.exists():
+            try:
+                print(f"\n🗑️  Cleaning up temporary files...")
+                shutil.rmtree(organized_folder)
+                logging.info(f"Cleaned up temporary files from {organized_folder}")
+                print(f"  ✓ Temporary files removed")
+            except Exception as e:
+                logging.warning(f"Could not remove temporary files: {e}")
+                print(f"  ⚠️  Could not remove temporary files: {e}")
+
+        # Remove temp directory if empty
+        try:
+            if temp_dir.exists() and not any(temp_dir.iterdir()):
+                temp_dir.rmdir()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
