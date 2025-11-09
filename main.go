@@ -46,6 +46,7 @@ func main() {
 	mountPoint := flag.String("mount", "", "SD card mount point")
 	photoshootName := flag.String("name", "", "Photoshoot name")
 	configPath := flag.String("config", "config.yaml", "Path to SMB config YAML file")
+	timeout := flag.Duration("timeout", 30*time.Second, "SMB connection timeout")
 	flag.Parse()
 
 	if *mountPoint == "" || *photoshootName == "" {
@@ -72,7 +73,7 @@ func main() {
 	slog.Info("Starting photo transfer", "folder", folderName, "mount_point", *mountPoint)
 
 	// Process photos
-	if err := processPhotos(*mountPoint, folderName, config); err != nil {
+	if err := processPhotos(*mountPoint, folderName, config, *timeout); err != nil {
 		slog.Error("Failed to process photos", "error", err)
 		os.Exit(1)
 	}
@@ -99,7 +100,7 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func processPhotos(mountPoint, folderName string, config *Config) error {
+func processPhotos(mountPoint, folderName string, config *Config, timeout time.Duration) error {
 	slog.Info("Scanning mount point for photos", "path", mountPoint)
 	// Walk through mount point and collect photo files
 	return filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
@@ -129,7 +130,7 @@ func processPhotos(mountPoint, folderName string, config *Config) error {
 
 		// Transfer to all SMB shares
 		for i, smbConfig := range config.SMBShares {
-			if err := transferToSMB(path, folderName, photoDate, smbConfig); err != nil {
+			if err := transferToSMB(path, folderName, photoDate, smbConfig, timeout); err != nil {
 				slog.Error("Failed to transfer to SMB share", "share_index", i, "host", smbConfig.Host, "error", err)
 			} else {
 				slog.Info("Successfully transferred to SMB share", "share_index", i, "host", smbConfig.Host)
@@ -163,9 +164,9 @@ func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
 	return tm, nil
 }
 
-func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SMBConfig) error {
+func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SMBConfig, timeout time.Duration) error {
 	slog.Info("Connecting to SMB share", "host", config.Host, "share", config.Share)
-	conn, err := connectSMB(config)
+	conn, err := connectSMB(config, timeout)
 	if err != nil {
 		return fmt.Errorf("connecting to SMB: %w", err)
 	}
@@ -199,14 +200,16 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, config SM
 	return nil
 }
 
-func connectSMB(config SMBConfig) (*smb2.Session, error) {
+func connectSMB(config SMBConfig, timeout time.Duration) (*smb2.Session, error) {
 	port := config.Port
 	if port == 0 {
 		port = 445
 	}
 
 	addr := net.JoinHostPort(config.Host, fmt.Sprintf("%d", port))
-	conn, err := net.Dial("tcp", addr)
+	
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %w", err)
 	}
