@@ -163,7 +163,31 @@ dmypy.json
 .pyre/
 
 # pytype static type analyzer
-.pytype/
+
+# Go specific entries
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Binary output directories
+/bin/
+/dist/.pytype/
 
 # Cython debug symbols
 cython_debug/

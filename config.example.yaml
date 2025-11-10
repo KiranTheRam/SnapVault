@@ -1,0 +1,14 @@
+smb_shares:
+  - host: "nas.local"
+    port: 445
+    share: "photos"
+    username: "photographer"
+    password: "${NAS_PASSWORD}"  # Environment variable expansion supported
+    base_path: "Photoshoots"
+  
+  - host: "backup-nas.local"
+    port: 445
+    share: "backup"
+    username: "backup-user"
+    password: "${BACKUP_NAS_PASSWORD}"  # Or use direct value: "backup-password"
+    base_path: "PhotoBackups"
