@@ -225,25 +225,34 @@ func processPhotos(ctx context.Context, mountPoint, folderName string, connectio
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for job := range jobs {
-				// Check for cancellation
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				default:
-				}
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
 
-				// Transfer to all SMB shares
-				for i, conn := range connections {
-					if err := transferToSMB(job.SourcePath, job.FolderName, job.PhotoDate, conn); err != nil {
-						slog.Error("Failed to transfer to SMB share", "file", job.SourcePath, "share_index", i, "host", conn.Config.Host, "error", err)
-						tfChan <- TransferError{
-							FilePath: job.SourcePath,
-							Share:    fmt.Sprintf("%s/%s", conn.Config.Host, conn.Config.Share),
-							Error:    err,
+					// Transfer to all SMB shares
+					for i, conn := range connections {
+						// Check for cancellation between transfers
+						select {
+						case <-ctx.Done():
+							return
+						default:
 						}
-					} else {
-						slog.Info("Successfully transferred to SMB share", "file", filepath.Base(job.SourcePath), "share_index", i, "host", conn.Config.Host)
+
+						if err := transferToSMB(ctx, job.SourcePath, job.FolderName, job.PhotoDate, conn); err != nil {
+							slog.Error("Failed to transfer to SMB share", "file", job.SourcePath, "share_index", i, "host", conn.Config.Host, "error", err)
+							tfChan <- TransferError{
+								FilePath: job.SourcePath,
+								Share:    fmt.Sprintf("%s/%s", conn.Config.Host, conn.Config.Share),
+								Error:    err,
+							}
+						} else {
+							slog.Info("Successfully transferred to SMB share", "file", filepath.Base(job.SourcePath), "share_index", i, "host", conn.Config.Host)
+						}
 					}
 				}
 			}
@@ -346,7 +355,7 @@ func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
 	return tm, nil
 }
 
-func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMBConnection) error {
+func transferToSMB(ctx context.Context, sourcePath, folderName string, photoDate time.Time, conn *SMBConnection) error {
 	// Create folder structure: basePath/folderName/YYYY-MM-DD/
 	dateFolder := photoDate.Format("2006-01-02")
 	destDir := filepath.Join(conn.Config.BasePath, folderName, dateFolder)
@@ -354,7 +363,7 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMB
 	// Check cache first
 	if _, exists := conn.createdDirs.Load(destDir); !exists {
 		slog.Info("Creating destination directory", "path", destDir)
-		if err := mkdirAllSMB(conn.Share, destDir); err != nil {
+		if err := mkdirAllSMB(ctx, conn.Share, destDir); err != nil {
 			return fmt.Errorf("creating directories: %w", err)
 		}
 		// Cache the successfully created path
@@ -366,7 +375,7 @@ func transferToSMB(sourcePath, folderName string, photoDate time.Time, conn *SMB
 	destPath := filepath.Join(destDir, fileName)
 
 	slog.Info("Copying file to SMB", "source", fileName, "destination", destPath)
-	if err := copyFileToSMB(sourcePath, conn.Share, destPath); err != nil {
+	if err := copyFileToSMB(ctx, sourcePath, conn.Share, destPath); err != nil {
 		return fmt.Errorf("copying file: %w", err)
 	}
 
@@ -408,7 +417,10 @@ func connectSMB(ctx context.Context, config SMBConfig, timeout time.Duration) (*
 }
 
 // mkdirAllSMB creates all directories in the path
-func mkdirAllSMB(fs *smb2.Share, path string) error {
+func mkdirAllSMB(ctx context.Context, fs *smb2.Share, path string) error {
+	// Use context-aware share
+	fs = fs.WithContext(ctx)
+
 	// Normalize path separators to forward slashes
 	path = filepath.ToSlash(path)
 
@@ -439,7 +451,10 @@ func mkdirAllSMB(fs *smb2.Share, path string) error {
 	return nil
 }
 
-func copyFileToSMB(sourcePath string, fs *smb2.Share, destPath string) error {
+func copyFileToSMB(ctx context.Context, sourcePath string, fs *smb2.Share, destPath string) error {
+	// Use context-aware share
+	fs = fs.WithContext(ctx)
+
 	// Normalize path separators
 	destPath = filepath.ToSlash(destPath)
 
