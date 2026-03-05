@@ -2,13 +2,18 @@
 
 **Professional Camera Photo Organizer with NAS Integration**
 
-SnapVault is a high-performance Golang CLI tool designed for photographers who need an automated workflow to organize and backup photos directly from SD cards to network storage. It automatically organizes photos by date using EXIF metadata and transfers them directly to SMB shares with parallel processing and optimized network operations.
+SnapVault is a high-performance Golang terminal app designed for photographers who need an automated workflow to organize and backup photos directly from SD cards to network storage. It provides an interactive TUI for selecting NAS shares and SD card mount points, then organizes photos by date using EXIF metadata and transfers them directly to SMB shares with parallel processing and optimized network operations.
 
 ---
 
 ## ✨ Features
 
 ### Core Functionality
+- **🫧 Bubble Tea TUI Workflow**: Prompt-based terminal UI for selecting NAS shares and SD card mount points
+- **🧭 App-Style Setup Layout**: A persistent setup panel shows chosen NAS connections, mount path, and photoshoot details as you move through steps
+- **🔌 Live NAS Validation**: Manual NAS details are tested immediately; failures show detailed errors and let you correct input
+- **💾 Saved Successful Connections**: Successfully validated NAS connections are persisted and offered next launch
+- **✍️ Manual Fallback Input**: If auto-detected/configured options are not suitable, enter NAS targets and mount paths manually with format guidance
 - **📅 Automatic Date Organization**: Extracts EXIF date data from photos and organizes them into dated subfolders (YYYY-MM-DD)
 - **🏗️ Year-Prefixed Folders**: Automatically prepends the current year to your photoshoot folder names (e.g., "2025 - Wedding")
 - **🚀 Direct Transfer**: Photos go straight from SD card to NAS without copying to local storage
@@ -20,6 +25,7 @@ SnapVault is a high-performance Golang CLI tool designed for photographers who n
 - **🔄 Connection Reuse**: SMB connections established once and reused across all transfers
 - **💾 Directory Caching**: Smart caching prevents redundant directory creation across workers
 - **🎯 Optimized Network I/O**: Eliminates unnecessary Stat calls, reducing network round trips by 50%
+- **📈 Live Transfer Progress Bar**: Interactive mode displays real-time per-photo transfer progress and current file
 
 ### Reliability & Safety
 - **🛑 Graceful Shutdown**: Proper signal handling (SIGINT/SIGTERM) with context propagation
@@ -37,7 +43,7 @@ SnapVault is a high-performance Golang CLI tool designed for photographers who n
 
 ## 📋 Requirements
 
-- Go 1.23 or higher
+- Go 1.24.2 or higher
 - Network access to SMB shares
 - SD card reader and mount point
 
@@ -57,20 +63,21 @@ go build -o snapvault
 
 ## ⚙️ Configuration
 
-Create a `config.yaml` file (see `config.example.yaml` for reference) with your SMB share details:
+Create a `config.yaml` file (see `config.example.yaml` for reference) with your SMB share details.
+In interactive mode, SnapVault can start without an existing config and save validated NAS targets to this file:
 
 ```yaml
 smb_shares:
-  - host: "nas.local"
+  - host: "192.168.1.33"
     port: 445
-    share: "photos"
+    share: "share_name"
     username: "photographer"
     password: "${NAS_PASSWORD}"  # Environment variable expansion supported
-    base_path: "Photoshoots"
+    base_path: "folder_in_share" # optional: path inside the share
   
   - host: "backup-nas.local"
     port: 445
-    share: "backup"
+    share: "backup_share"
     username: "backup-user"
     password: "${BACKUP_NAS_PASSWORD}"  # Or use direct value: "backup-password"
     base_path: "PhotoBackups"
@@ -85,6 +92,25 @@ smb_shares:
 - **password**: Authentication password (supports environment variable expansion with `${VAR}` syntax)
 - **base_path**: Base directory within the share where photoshoot folders will be created
 
+### NAS Target Format in TUI
+
+When adding a NAS connection in the TUI, enter:
+
+1. `NAS URL/IP`: `host` or `host:port` (example: `192.168.1.33`)
+2. `Share path`: `share[/path_inside_share]` (example: `general/snapvault`)
+
+The TUI also accepts a combined value pasted into the host field:
+
+- `host[:port]/share[/path_inside_share]`
+- Example: `192.168.1.33/share_name/folder_in_share`
+
+This maps to:
+
+- `host`: `192.168.1.33`
+- `port`: `445` (default if omitted)
+- `share`: `share_name`
+- `base_path`: `folder_in_share` (optional)
+
 ### Environment Variables
 
 Set environment variables for secure password management:
@@ -92,7 +118,7 @@ Set environment variables for secure password management:
 ```bash
 export NAS_PASSWORD="your-secure-password"
 export BACKUP_NAS_PASSWORD="your-backup-password"
-./snapvault -mount /media/sdcard -name "Wedding"
+./snapvault
 ```
 
 ---
@@ -100,21 +126,39 @@ export BACKUP_NAS_PASSWORD="your-backup-password"
 ## 📖 Usage
 
 ```bash
-./snapvault -mount <SD_CARD_MOUNT_POINT> -name <PHOTOSHOOT_NAME> [OPTIONS]
+./snapvault [OPTIONS]
 ```
 
 ### Flags
 
-- `-mount`: Path to SD card mount point (required)
-- `-name`: Photoshoot name (required, will be prefixed with current year)
+- `-mount`: Path to SD card mount point (optional; if omitted, selected in TUI)
+- `-name`: Photoshoot name (optional; if omitted, entered in TUI and prefixed with current year)
 - `-config`: Path to YAML config file (default: `config.yaml`)
 - `-workers`: Number of parallel workers for file transfers (default: `4`)
 - `-timeout`: SMB connection timeout (default: `30s`)
 
+For non-interactive runs (`-mount` and `-name` provided), the config file must exist and include at least one SMB share.
+
+### Interactive TUI Flow
+
+When `-mount` or `-name` is missing, SnapVault launches interactive mode:
+
+1. Shows saved NAS connections from `config.yaml` and lets you select one or many
+2. Lets you add a new NAS target in format `host[:port]/share[/path_inside_share]`
+   - Or enter it as separate fields: host + share path (starting with share name)
+3. Attempts a real SMB connection immediately and reports success/failure details
+4. On success, saves the NAS connection so it appears next launch
+5. Shows detected mounted device paths for SD cards with manual fallback
+6. Prompts for photoshoot name
+7. Shows a live progress bar while transferring and a final summary screen with results
+
 ### Examples
 
 ```bash
-# Basic usage with default settings
+# Launch interactive TUI (recommended)
+./snapvault
+
+# Non-interactive run with all required values
 ./snapvault -mount /media/sdcard -name "Wedding"
 
 # Use more workers for faster transfers
@@ -231,8 +275,7 @@ smbclient //nas.local/photos -U photographer
 ### Cancellation
 
 - Press `Ctrl+C` once for graceful shutdown
-- Workers will finish current operations and clean up connections
-- Press `Ctrl+C` twice for immediate termination (not recommended)
+- In-flight work is canceled via context and SMB sessions are cleaned up before exit
 
 ---
 
