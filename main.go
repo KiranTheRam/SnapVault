@@ -11,8 +11,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -53,6 +56,17 @@ type TransferError struct {
 	Error    error
 }
 
+type TransferProgressHook struct {
+	OnStart    func(total int)
+	OnProgress func(total, completed int, filePath string)
+}
+
+type MountCandidate struct {
+	Source string
+	Path   string
+	FSType string
+}
+
 var photoExtensions = map[string]bool{
 	".jpg":  true,
 	".jpeg": true,
@@ -75,12 +89,14 @@ func main() {
 	flag.Parse()
 
 	if *mountPoint == "" || *photoshootName == "" {
-		slog.Error("Both -mount and -name flags are required")
-		flag.Usage()
-		os.Exit(1)
+		err := runInteractiveTUI(*configPath, *mountPoint, *photoshootName, *timeout, *workers)
+		if err != nil {
+			slog.Error("Interactive session failed", "error", err)
+			os.Exit(1)
+		}
+		return
 	}
 
-	// Load config
 	config, err := loadConfig(*configPath)
 	if err != nil {
 		slog.Error("Failed to load config", "error", err)
@@ -118,7 +134,7 @@ func main() {
 	defer closeConnections(connections)
 
 	// Process photos
-	transferErrors, err := processPhotos(ctx, *mountPoint, folderName, connections, *workers)
+	transferErrors, err := processPhotos(ctx, *mountPoint, folderName, connections, *workers, nil)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("Photo transfer cancelled by user")
@@ -141,7 +157,207 @@ func main() {
 	slog.Info("Photo transfer completed successfully")
 }
 
+func parseManualSMBTarget(value string) (string, int, string, string, error) {
+	target := strings.TrimSpace(value)
+	target = strings.TrimPrefix(target, "smb://")
+	target = strings.TrimPrefix(target, "//")
+	target = strings.Trim(target, "/")
+
+	parts := strings.SplitN(target, "/", 3)
+	if len(parts) < 2 {
+		return "", 0, "", "", fmt.Errorf("expected host[:port]/share[/path] format")
+	}
+
+	hostPort := strings.TrimSpace(parts[0])
+	sharePath := strings.Join(parts[1:], "/")
+	if hostPort == "" || strings.TrimSpace(sharePath) == "" {
+		return "", 0, "", "", fmt.Errorf("host and share are required")
+	}
+
+	host, port, err := parseSMBHostPort(hostPort)
+	if err != nil {
+		return "", 0, "", "", err
+	}
+
+	share, basePath, err := parseSMBSharePath(sharePath)
+	if err != nil {
+		return "", 0, "", "", err
+	}
+
+	return host, port, share, basePath, nil
+}
+
+func parseSMBHostPort(value string) (string, int, error) {
+	hostPort := strings.TrimSpace(value)
+	hostPort = strings.TrimPrefix(hostPort, "smb://")
+	hostPort = strings.TrimPrefix(hostPort, "//")
+	hostPort = strings.Trim(hostPort, "/")
+
+	if hostPort == "" {
+		return "", 0, fmt.Errorf("host is required")
+	}
+	if strings.Contains(hostPort, "/") {
+		return "", 0, fmt.Errorf("host must not contain '/'; use separate share path field")
+	}
+
+	port := 445
+	host := hostPort
+	if idx := strings.LastIndex(hostPort, ":"); idx > 0 && idx < len(hostPort)-1 {
+		parsedPort, err := strconv.Atoi(hostPort[idx+1:])
+		if err != nil || parsedPort <= 0 || parsedPort > 65535 {
+			return "", 0, fmt.Errorf("invalid port in %q", hostPort)
+		}
+		host = hostPort[:idx]
+		port = parsedPort
+	}
+
+	if strings.TrimSpace(host) == "" {
+		return "", 0, fmt.Errorf("host is required")
+	}
+
+	return host, port, nil
+}
+
+func parseSMBSharePath(value string) (string, string, error) {
+	path := strings.TrimSpace(value)
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return "", "", fmt.Errorf("share path is required")
+	}
+
+	parts := strings.SplitN(path, "/", 2)
+	share := strings.TrimSpace(parts[0])
+	basePath := ""
+	if len(parts) == 2 {
+		basePath = strings.Trim(parts[1], "/")
+	}
+
+	if share == "" {
+		return "", "", fmt.Errorf("share name is required")
+	}
+
+	return share, basePath, nil
+}
+
+func validateMountPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	return nil
+}
+
+func detectMountCandidates() []MountCandidate {
+	candidateMap := make(map[string]MountCandidate)
+
+	// Linux mount discovery.
+	if data, err := os.ReadFile("/proc/mounts"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+
+			source := decodeProcMountField(fields[0])
+			path := decodeProcMountField(fields[1])
+			fsType := decodeProcMountField(fields[2])
+
+			if !looksLikeSDMount(source, path, fsType) {
+				continue
+			}
+
+			if _, err := os.Stat(path); err == nil {
+				candidateMap[path] = MountCandidate{Source: source, Path: path, FSType: fsType}
+			}
+		}
+	}
+
+	// Directory scan fallback for common mount roots.
+	scanRoots := []string{"/media", "/run/media/" + os.Getenv("USER"), "/Volumes", "/mnt"}
+	for _, root := range scanRoots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			path := filepath.Join(root, entry.Name())
+			if root == "/media" || strings.HasPrefix(root, "/run/media/") {
+				subEntries, err := os.ReadDir(path)
+				if err == nil {
+					for _, sub := range subEntries {
+						if !sub.IsDir() {
+							continue
+						}
+						subPath := filepath.Join(path, sub.Name())
+						candidateMap[subPath] = MountCandidate{Path: subPath}
+					}
+				}
+			}
+			candidateMap[path] = MountCandidate{Path: path}
+		}
+	}
+
+	candidates := make([]MountCandidate, 0, len(candidateMap))
+	for _, c := range candidateMap {
+		candidates = append(candidates, c)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Path < candidates[j].Path
+	})
+
+	return candidates
+}
+
+func looksLikeSDMount(source, path, fsType string) bool {
+	if path == "" {
+		return false
+	}
+
+	if strings.HasPrefix(path, "/media/") || strings.HasPrefix(path, "/run/media/") || strings.HasPrefix(path, "/Volumes/") {
+		return true
+	}
+
+	if strings.HasPrefix(path, "/mnt/") && strings.HasPrefix(source, "/dev/") {
+		return true
+	}
+
+	if strings.HasPrefix(source, "/dev/sd") || strings.HasPrefix(source, "/dev/mmc") || strings.HasPrefix(source, "/dev/disk") {
+		switch fsType {
+		case "vfat", "exfat", "ntfs", "fuseblk", "ext4", "ext3", "ext2", "msdos", "apfs", "hfs", "hfsplus":
+			return true
+		}
+	}
+
+	return false
+}
+
+func decodeProcMountField(value string) string {
+	replacer := strings.NewReplacer(
+		`\\`, `\`,
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+	)
+	return replacer.Replace(value)
+}
+
 func loadConfig(path string) (*Config, error) {
+	return loadConfigFromFile(path, true)
+}
+
+func loadConfigRaw(path string) (*Config, error) {
+	return loadConfigFromFile(path, false)
+}
+
+func loadConfigFromFile(path string, expandPasswords bool) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
@@ -152,12 +368,26 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
-	// Expand environment variables in passwords
-	for i := range config.SMBShares {
-		config.SMBShares[i].Password = os.ExpandEnv(config.SMBShares[i].Password)
+	if expandPasswords {
+		for i := range config.SMBShares {
+			config.SMBShares[i].Password = os.ExpandEnv(config.SMBShares[i].Password)
+		}
 	}
 
 	return &config, nil
+}
+
+func saveConfig(path string, config *Config) error {
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
+
+	return nil
 }
 
 func establishConnections(ctx context.Context, config *Config, timeout time.Duration) ([]*SMBConnection, error) {
@@ -212,19 +442,34 @@ func closeConnections(connections []*SMBConnection) {
 	}
 }
 
-func processPhotos(ctx context.Context, mountPoint, folderName string, connections []*SMBConnection, workers int) ([]TransferError, error) {
+func processPhotos(
+	ctx context.Context,
+	mountPoint, folderName string,
+	connections []*SMBConnection,
+	workers int,
+	hook *TransferProgressHook,
+) ([]TransferError, error) {
 	slog.Info("Scanning mount point for photos", "path", mountPoint, "workers", workers)
 
 	// Create channels
 	jobs := make(chan TransferJob)
 	tfChan := make(chan TransferError, workers)
-	var wg sync.WaitGroup
+	var workerWG sync.WaitGroup
+	var completedCount int64
+
+	photoJobs, collectErr := collectTransferJobs(ctx, mountPoint, folderName)
+	if collectErr != nil {
+		return nil, collectErr
+	}
+	if hook != nil && hook.OnStart != nil {
+		hook.OnStart(len(photoJobs))
+	}
 
 	// Start worker pool
 	for i := 0; i < workers; i++ {
-		wg.Add(1)
+		workerWG.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+			defer workerWG.Done()
 			for {
 				select {
 				case <-ctx.Done():
@@ -254,6 +499,11 @@ func processPhotos(ctx context.Context, mountPoint, folderName string, connectio
 							slog.Info("Successfully transferred to SMB share", "file", filepath.Base(job.SourcePath), "share_index", i, "host", conn.Config.Host)
 						}
 					}
+
+					processed := int(atomic.AddInt64(&completedCount, 1))
+					if hook != nil && hook.OnProgress != nil {
+						hook.OnProgress(len(photoJobs), processed, job.SourcePath)
+					}
 				}
 			}
 		}(i)
@@ -261,17 +511,45 @@ func processPhotos(ctx context.Context, mountPoint, folderName string, connectio
 
 	// Start error collector
 	var transferErrors []TransferError
-	wg.Add(1)
+	var collectorWG sync.WaitGroup
+	collectorWG.Add(1)
 	go func() {
-		defer wg.Done()
+		defer collectorWG.Done()
 		for e := range tfChan {
 			transferErrors = append(transferErrors, e)
 		}
 	}()
 
-	// Walk directory and queue jobs
-	walkErr := filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
-		// Check for cancellation
+	// Queue jobs.
+	for _, job := range photoJobs {
+		select {
+		case jobs <- job:
+		case <-ctx.Done():
+			close(jobs)
+			workerWG.Wait()
+			close(tfChan)
+			collectorWG.Wait()
+			return transferErrors, ctx.Err()
+		}
+	}
+
+	// Close jobs channel.
+	close(jobs)
+
+	// Wait for workers before closing transfer error channel.
+	workerWG.Wait()
+	close(tfChan)
+
+	// Wait for the error collector.
+	collectorWG.Wait()
+
+	return transferErrors, nil
+}
+
+func collectTransferJobs(ctx context.Context, mountPoint, folderName string) ([]TransferJob, error) {
+	jobs := make([]TransferJob, 0, 1024)
+
+	err := filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -280,56 +558,35 @@ func processPhotos(ctx context.Context, mountPoint, folderName string, connectio
 
 		if err != nil {
 			slog.Warn("Error accessing path", "path", path, "error", err)
-			return nil // Continue with other files
+			return nil
 		}
-
 		if info.IsDir() {
 			return nil
 		}
 
-		// Check if file is a photo
 		ext := strings.ToLower(filepath.Ext(path))
 		if !photoExtensions[ext] {
 			return nil
 		}
 
-		slog.Info("Processing photo", "file", path)
-
-		// Get photo date
-		photoDate, err := getPhotoDate(path, info)
-		if err != nil {
-			slog.Warn("Failed to get photo date, using file mod time", "file", path, "error", err)
+		photoDate, dateErr := getPhotoDate(path, info)
+		if dateErr != nil {
+			slog.Warn("Failed to get photo date, using file mod time", "file", path, "error", dateErr)
 			photoDate = info.ModTime()
 		}
 
-		// Queue the job (blocks when all workers are busy - backpressure)
-		select {
-		case jobs <- TransferJob{
+		jobs = append(jobs, TransferJob{
 			SourcePath: path,
 			FolderName: folderName,
 			PhotoDate:  photoDate,
-		}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
+		})
 		return nil
 	})
-
-	// Close jobs channel and
-	close(jobs)
-
-	// Close tfChan channel
-	close(tfChan)
-
-	// wait for workers and wait for collector
-	wg.Wait()
-
-	if walkErr != nil {
-		return transferErrors, walkErr
+	if err != nil {
+		return nil, err
 	}
 
-	return transferErrors, nil
+	return jobs, nil
 }
 
 func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
