@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SnapVault</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='42' fill='none' stroke='%23e0884a' stroke-width='8'/><circle cx='50' cy='50' r='14' fill='%23e0884a'/></svg>" />
+</head>
+<body>
+  <div class="grain"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="aperture" aria-hidden="true"></span>
+      <div>
+        <h1>SnapVault</h1>
+        <p class="tagline">Import &amp; archive to NAS</p>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
+      <span id="server-pill" class="pill pill-ok">local engine</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Left rail: stepper + live summary -->
+    <aside class="rail">
+      <ol class="stepper" id="stepper">
+        <li data-step="destinations"><span class="dot"></span><span class="label">Destinations</span></li>
+        <li data-step="source"><span class="dot"></span><span class="label">Source card</span></li>
+        <li data-step="details"><span class="dot"></span><span class="label">Shoot details</span></li>
+        <li data-step="transfer"><span class="dot"></span><span class="label">Transfer</span></li>
+      </ol>
+
+      <div class="summary">
+        <h3>Plan</h3>
+        <dl>
+          <dt>Destinations</dt>
+          <dd id="sum-dest">none selected</dd>
+          <dt>Source</dt>
+          <dd id="sum-source" class="mono">not set</dd>
+          <dt>On card</dt>
+          <dd id="sum-scan">—</dd>
+          <dt>Folder</dt>
+          <dd id="sum-folder" class="mono">—</dd>
+        </dl>
+      </div>
+    </aside>
+
+    <!-- Right: step panels -->
+    <section class="stage">
+      <div id="toast" class="toast" hidden></div>
+
+      <!-- STEP: destinations -->
+      <article class="panel" data-panel="destinations">
+        <header class="panel-head">
+          <h2>Where should photos land?</h2>
+          <p>Pick one or more NAS shares. Transfers run to all of them for redundancy.</p>
+        </header>
+
+        <div id="share-list" class="card-grid"></div>
+
+        <button class="ghost-add" id="show-add-share">
+          <span class="plus">+</span> Add a NAS share
+        </button>
+
+        <form class="add-form" id="add-share-form" hidden>
+          <h3>New SMB share</h3>
+          <div class="field-row">
+            <label>Host / IP
+              <input name="host" placeholder="192.168.1.33" autocomplete="off" />
+            </label>
+            <label class="narrow">Port
+              <input name="port" placeholder="445" inputmode="numeric" />
+            </label>
+          </div>
+          <div class="field-row">
+            <label>Share
+              <input name="share" placeholder="RAW Photos" autocomplete="off" />
+            </label>
+            <label>Path inside share <span class="opt">optional</span>
+              <input name="basePath" placeholder="2026/imports" autocomplete="off" />
+            </label>
+          </div>
+          <div class="field-row">
+            <label>Username
+              <input name="username" placeholder="kiran" autocomplete="off" />
+            </label>
+            <label>Password
+              <input name="password" type="password" placeholder="••••••••" autocomplete="off" />
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn-secondary" id="test-share">Test connection</button>
+            <button type="submit" class="btn-primary" id="save-share">Test &amp; save</button>
+            <button type="button" class="btn-text" id="cancel-add-share">Cancel</button>
+            <span id="add-share-status" class="inline-status"></span>
+          </div>
+        </form>
+      </article>
+
+      <!-- STEP: source -->
+      <article class="panel" data-panel="source" hidden>
+        <header class="panel-head">
+          <h2>Which card are we reading?</h2>
+          <p>Detected volumes are listed below, or type a path. Scanning previews what will transfer.</p>
+        </header>
+
+        <div id="mount-list" class="card-grid"></div>
+
+        <form class="inline-form" id="manual-mount-form">
+          <label class="grow">Or enter a path
+            <input name="mount" class="mono" placeholder="/Volumes/SDCARD" autocomplete="off" />
+          </label>
+          <button type="button" class="btn-secondary" id="browse-btn">📁 Browse…</button>
+          <button type="submit" class="btn-secondary">Use path</button>
+        </form>
+
+        <div id="scan-result" class="scan-result" hidden></div>
+      </article>
+
+      <!-- STEP: details -->
+      <article class="panel" data-panel="details" hidden>
+        <header class="panel-head">
+          <h2>Name this shoot</h2>
+          <p>Photos are filed under <span class="mono" id="year-hint"></span> by capture date.</p>
+        </header>
+        <form id="details-form" class="inline-form">
+          <label class="grow">Shoot name
+            <input name="name" placeholder="Wedding — Smith" autocomplete="off" />
+          </label>
+        </form>
+        <p class="preview-folder">Target folder: <span class="mono" id="folder-preview">—</span></p>
+      </article>
+
+      <!-- STEP: transfer -->
+      <article class="panel" data-panel="transfer" hidden>
+        <header class="panel-head">
+          <h2 id="transfer-title">Transferring…</h2>
+          <p id="transfer-sub">Streaming straight from card to NAS.</p>
+        </header>
+
+        <div class="progress-block">
+          <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress-meta">
+            <span id="progress-count">0 / 0</span>
+            <span id="progress-pct" class="mono">0%</span>
+          </div>
+          <p class="current-file mono" id="current-file"></p>
+        </div>
+
+        <div id="summary-block" class="summary-block" hidden></div>
+      </article>
+
+      <!-- Footer nav -->
+      <footer class="stage-nav">
+        <button class="btn-text" id="nav-back" hidden>← Back</button>
+        <div class="spacer"></div>
+        <button class="btn-primary" id="nav-next">Continue →</button>
+      </footer>
+    </section>
+  </main>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal" hidden>
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2>Notifications</h2>
+        <button class="icon-btn" data-close title="Close">×</button>
+      </header>
+      <p class="modal-sub">Get an <span class="mono">ntfy</span> push when a transfer finishes or fails. Leave both blank to disable.</p>
+      <form id="ntfy-form">
+        <label>ntfy server
+          <input name="server" class="mono" placeholder="https://ntfy.sh" autocomplete="off" />
+        </label>
+        <label>Topic
+          <input name="topic" class="mono" placeholder="snapvault" autocomplete="off" />
+        </label>
+        <div class="field-row">
+          <label>Username <span class="opt">if your server requires auth</span>
+            <input name="username" autocomplete="off" />
+          </label>
+          <label>Password
+            <input name="password" type="password" autocomplete="off" />
+          </label>
+        </div>
+        <details class="basic-auth">
+          <summary>Use an access token instead</summary>
+          <label>Access token
+            <input name="token" type="password" placeholder="tk_…" autocomplete="off" />
+          </label>
+        </details>
+        <div class="form-actions">
+          <button type="button" class="btn-secondary" id="ntfy-test">Send test</button>
+          <button type="submit" class="btn-primary">Save</button>
+          <span id="ntfy-status" class="inline-status"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

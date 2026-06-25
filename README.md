@@ -1,284 +1,232 @@
-# 📸 SnapVault
+# SnapVault
 
-**Professional Camera Photo Organizer with NAS Integration**
+**Camera import and archiving tool for photographers with a NAS.**
 
-SnapVault is a high-performance Golang terminal app designed for photographers who need an automated workflow to organize and backup photos directly from SD cards to network storage. It provides an interactive TUI for selecting NAS shares and SD card mount points, then organizes photos by date using EXIF metadata and transfers them directly to SMB shares with parallel processing and optimized network operations.
-
----
-
-## ✨ Features
-
-### Core Functionality
-- **🫧 Bubble Tea TUI Workflow**: Prompt-based terminal UI for selecting NAS shares and SD card mount points
-- **🧭 App-Style Setup Layout**: A persistent setup panel shows chosen NAS connections, mount path, and photoshoot details as you move through steps
-- **🔌 Live NAS Validation**: Manual NAS details are tested immediately; failures show detailed errors and let you correct input
-- **💾 Saved Successful Connections**: Successfully validated NAS connections are persisted and offered next launch
-- **✍️ Manual Fallback Input**: If auto-detected/configured options are not suitable, enter NAS targets and mount paths manually with format guidance
-- **📅 Automatic Date Organization**: Extracts EXIF date data from photos and organizes them into dated subfolders (YYYY-MM-DD)
-- **🏗️ Year-Prefixed Folders**: Automatically prepends the current year to your photoshoot folder names (e.g., "2025 - Wedding")
-- **🚀 Direct Transfer**: Photos go straight from SD card to NAS without copying to local storage
-- **🌐 Multiple NAS Support**: Transfer to multiple SMB shares simultaneously for redundancy
-- **📸 Wide Format Support**: Handles common photo formats including JPG, PNG, CR2, NEF, ARW, DNG, ORF, RW2, RAW
-
-### Performance & Optimization
-- **⚡ Parallel Processing**: Configurable worker pool (default: 4) for concurrent file transfers
-- **🔄 Connection Reuse**: SMB connections established once and reused across all transfers
-- **💾 Directory Caching**: Smart caching prevents redundant directory creation across workers
-- **🎯 Optimized Network I/O**: Eliminates unnecessary Stat calls, reducing network round trips by 50%
-- **📈 Live Transfer Progress Bar**: Interactive mode displays real-time per-photo transfer progress and current file
-
-### Reliability & Safety
-- **🛑 Graceful Shutdown**: Proper signal handling (SIGINT/SIGTERM) with context propagation
-- **⏱️ Configurable Timeout**: Connection timeout to prevent indefinite hangs (default: 30s)
-- **📊 Error Reporting**: Comprehensive error summary showing which files failed and why
-- **✅ Context Cancellation**: Operations can be cancelled mid-flight, including during large file transfers
-
-### Security & Configuration
-- **🔐 SMB Authentication**: Username/password authentication for secure shares
-- **🔑 Environment Variables**: Password expansion using environment variables (e.g., `${NAS_PASSWORD}`)
-- **📝 Structured Logging**: Progress and error logging using Go's `log/slog`
-- **⚙️ YAML Configuration**: Clean, declarative configuration for multiple SMB shares
+SnapVault reads photos and videos from an SD card and streams them directly to one or more SMB shares — no intermediate copy to local storage. Files are organized by EXIF capture date under a named shoot folder. It ships with a local web UI for guided imports and a terminal TUI for keyboard-driven workflows.
 
 ---
 
-## 📋 Requirements
+## How it works
 
-- Go 1.24.2 or higher
-- Network access to SMB shares
-- SD card reader and mount point
+```
+SD card (/Volumes/SDCARD)
+        │
+        │  reads EXIF, filters macOS metadata
+        ▼
+  SnapVault (runs locally on your Mac)
+        │
+        │  SMB over LAN (userspace — no OS mount required)
+        ▼
+  NAS share  (e.g. Unraid → "RAW Photos")
+        └── 2026 - Wedding/
+                ├── 2026-06-14/
+                │       ├── DSC_0001.NEF
+                │       └── DSC_0002.NEF
+                └── 2026-06-15/
+                        └── DSC_0003.ARW
+```
+
+Every transfer is size-verified after copy. macOS sidecar files (`._*`, `.DS_Store`) are silently skipped. Multiple NAS shares can be targeted simultaneously for redundancy.
 
 ---
 
-## 🚀 Installation
+## Requirements
 
-Clone the repository and build the binary:
+- macOS (primary platform; Linux is supported for the CLI/TUI)
+- Go 1.24.2 or later
+- LAN access to an SMB share
+
+---
+
+## Installation
 
 ```bash
 git clone https://github.com/KiranTheRam/SnapVault.git
 cd SnapVault
-go build -o snapvault
+go build -o snapvault .
 ```
+
+### System-wide alias (macOS / zsh)
+
+`start.sh` wraps the binary — it rebuilds automatically if any source or web asset has changed, and always uses the correct config regardless of which directory you launch from.
+
+```bash
+# Add once to ~/.zshrc
+alias snapvault='/path/to/SnapVault/start.sh'
+```
+
+After `source ~/.zshrc` you can run `snapvault` from anywhere.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-Create a `config.yaml` file (see `config.example.yaml` for reference) with your SMB share details.
-In interactive mode, SnapVault can start without an existing config and save validated NAS targets to this file:
+SnapVault stores everything in `config.yaml` (created automatically on first save, permissions `0600`). The file is intentionally excluded from version control to keep credentials out of git.
+
+### NAS shares
 
 ```yaml
 smb_shares:
   - host: "192.168.1.33"
-    port: 445
-    share: "share_name"
-    username: "photographer"
-    password: "${NAS_PASSWORD}"  # Environment variable expansion supported
-    base_path: "folder_in_share" # optional: path inside the share
-  
-  - host: "backup-nas.local"
-    port: 445
-    share: "backup_share"
-    username: "backup-user"
-    password: "${BACKUP_NAS_PASSWORD}"  # Or use direct value: "backup-password"
-    base_path: "PhotoBackups"
+    port: 445                       # default; omit if 445
+    share: "RAW Photos"
+    username: "kiran"
+    password: "${NAS_PASSWORD}"     # supports ${ENV_VAR} expansion
+    base_path: ""                   # optional subdirectory within the share
 ```
 
-### Configuration Fields
+Shares are added and tested through the web UI or TUI. You can target multiple shares; files are transferred to all of them in parallel.
 
-- **host**: NAS hostname or IP address
-- **port**: SMB port (default: 445)
-- **share**: SMB share name
-- **username**: Authentication username
-- **password**: Authentication password (supports environment variable expansion with `${VAR}` syntax)
-- **base_path**: Base directory within the share where photoshoot folders will be created
+### ntfy notifications
 
-### NAS Target Format in TUI
-
-When adding a NAS connection in the TUI, enter:
-
-1. `NAS URL/IP`: `host` or `host:port` (example: `192.168.1.33`)
-2. `Share path`: `share[/path_inside_share]` (example: `general/snapvault`)
-
-The TUI also accepts a combined value pasted into the host field:
-
-- `host[:port]/share[/path_inside_share]`
-- Example: `192.168.1.33/share_name/folder_in_share`
-
-This maps to:
-
-- `host`: `192.168.1.33`
-- `port`: `445` (default if omitted)
-- `share`: `share_name`
-- `base_path`: `folder_in_share` (optional)
-
-### Environment Variables
-
-Set environment variables for secure password management:
-
-```bash
-export NAS_PASSWORD="your-secure-password"
-export BACKUP_NAS_PASSWORD="your-backup-password"
-./snapvault
+```yaml
+ntfy:
+  server: "https://ntfy.sh"
+  topic: "snapvault"
+  # Protected servers — use one:
+  username: "kiran"
+  password: "${NTFY_PASSWORD}"
+  # token: "${NTFY_TOKEN}"          # bearer token alternative
 ```
+
+A push is sent on transfer completion (✅ folder name, file count, duration) or failure (🚨 high-priority, with error details). Configure via the ⚙ button in the web UI.
 
 ---
 
-## 📖 Usage
+## Usage
+
+### Web UI (recommended)
 
 ```bash
-./snapvault [OPTIONS]
+snapvault
+# or directly:
+./snapvault -serve
 ```
 
-### Flags
+Opens `http://127.0.0.1:8080` in your browser. The guided flow:
 
-- `-mount`: Path to SD card mount point (optional; if omitted, selected in TUI)
-- `-name`: Photoshoot name (optional; if omitted, entered in TUI and prefixed with current year)
-- `-config`: Path to YAML config file (default: `config.yaml`)
-- `-workers`: Number of parallel workers for file transfers (default: `4`)
-- `-timeout`: SMB connection timeout (default: `30s`)
+1. **Destinations** — select saved NAS shares or add a new one (connection is tested live before saving)
+2. **Source card** — choose a detected volume from `/Volumes`, click **Browse…** for a native folder picker, or type a path; the card is scanned immediately showing file count, total size, and a per-day breakdown
+3. **Shoot details** — name the shoot; files land under `<year> - <name>/YYYY-MM-DD/`
+4. **Transfer** — live progress bar with the current filename; a summary screen on completion
 
-For non-interactive runs (`-mount` and `-name` provided), the config file must exist and include at least one SMB share.
+Flags:
 
-### Interactive TUI Flow
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-serve` | — | Launch the web UI |
+| `-addr` | `127.0.0.1:8080` | Bind address |
+| `-no-open` | false | Don't auto-open the browser |
+| `-config` | `config.yaml` | Config file path |
+| `-workers` | `4` | Parallel transfer workers |
+| `-timeout` | `30s` | SMB connection timeout |
 
-When `-mount` or `-name` is missing, SnapVault launches interactive mode:
-
-1. Shows saved NAS connections from `config.yaml` and lets you select one or many
-2. Lets you add a new NAS target in format `host[:port]/share[/path_inside_share]`
-   - Or enter it as separate fields: host + share path (starting with share name)
-3. Attempts a real SMB connection immediately and reports success/failure details
-4. On success, saves the NAS connection so it appears next launch
-5. Shows detected mounted device paths for SD cards with manual fallback
-6. Prompts for photoshoot name
-7. Shows a live progress bar while transferring and a final summary screen with results
-
-### Examples
+### Terminal TUI
 
 ```bash
-# Launch interactive TUI (recommended)
-./snapvault
-
-# Non-interactive run with all required values
-./snapvault -mount /media/sdcard -name "Wedding"
-
-# Use more workers for faster transfers
-./snapvault -mount /media/sdcard -name "Concert" -workers 8
-
-# Custom config file and timeout
-./snapvault -mount /media/sdcard -name "Birthday Party" -config /etc/snapvault/config.yaml -timeout 60s
-
-# Mount point on macOS
-./snapvault -mount /Volumes/SDCARD -name "Portrait Session"
-
-# Graceful shutdown with Ctrl+C
-# Press Ctrl+C to cancel - operations stop immediately and connections are cleaned up
+./snapvault          # launches TUI when -mount or -name is omitted
 ```
 
-### Folder Structure
+The TUI mirrors the web UI workflow in the terminal using Bubble Tea. NAS connections tested and saved here are shared with the web UI (same `config.yaml`).
 
-Given a photoshoot name of "Wedding" in 2025, photos will be organized as:
+### Non-interactive CLI
+
+```bash
+./snapvault -mount /Volumes/SDCARD -name "Wedding"
+./snapvault -mount /Volumes/SDCARD -name "Concert" -workers 8
+```
+
+Requires an existing `config.yaml` with at least one share. Useful for scripting.
+
+---
+
+## Folder structure
+
+Given shoot name `"Wedding"` in 2026:
 
 ```
 <base_path>/
-└── 2025 - Wedding/
-    ├── 2025-11-01/
-    │   ├── IMG_001.jpg
-    │   └── IMG_002.CR2
-    ├── 2025-11-02/
-    │   └── IMG_003.jpg
-    └── 2025-11-03/
-        └── IMG_004.NEF
+└── 2026 - Wedding/
+    ├── 2026-06-14/
+    │   ├── DSC_0001.NEF
+    │   └── DSC_0002.CR2
+    └── 2026-06-15/
+        └── DSC_0003.ARW
 ```
+
+Dates come from the EXIF `DateTimeOriginal` field. Files without EXIF (videos, unsupported formats) fall back to the file modification time.
 
 ---
 
-## 📝 Logging & Error Reporting
+## Supported formats
 
-The tool uses structured logging via `log/slog` for real-time feedback:
+**Stills**
 
-```
-2025/11/09 17:00:00 INFO Starting photo transfer folder="2025 - Wedding" mount_point=/media/sdcard
-2025/11/09 17:00:00 INFO Establishing SMB connection index=0 host=nas.local share=photos
-2025/11/09 17:00:00 INFO Successfully connected to SMB share index=0 host=nas.local
-2025/11/09 17:00:01 INFO Scanning mount point for photos path=/media/sdcard workers=4
-2025/11/09 17:00:01 INFO Processing photo file=/media/sdcard/IMG_001.jpg
-2025/11/09 17:00:01 INFO Creating destination directory path=Photoshoots/2025 - Wedding/2025-11-09
-2025/11/09 17:00:02 INFO Copying file to SMB source=IMG_001.jpg destination=Photoshoots/2025 - Wedding/2025-11-09/IMG_001.jpg
-2025/11/09 17:00:03 INFO Successfully transferred to SMB share file=IMG_001.jpg share_index=0 host=nas.local
-```
+| Format | Extensions |
+|--------|------------|
+| JPEG | `.jpg` `.jpeg` |
+| PNG | `.png` |
+| HEIF | `.heic` `.heif` |
+| TIFF | `.tif` `.tiff` |
+| Canon RAW | `.cr2` `.cr3` |
+| Nikon RAW | `.nef` |
+| Sony RAW | `.arw` |
+| Adobe DNG | `.dng` |
+| Olympus RAW | `.orf` |
+| Panasonic RAW | `.rw2` |
+| Fujifilm RAW | `.raf` |
+| Pentax RAW | `.pef` |
+| Samsung RAW | `.srw` |
+| Generic RAW | `.raw` |
 
-### Error Summary
+**Video**
 
-If any transfers fail, a comprehensive error summary is displayed at the end:
+`.mov` `.mp4` `.m4v` `.avi` `.mts` `.m2ts` `.mxf`
 
-```
-=== Transfer Error Summary ===
-File: /media/sdcard/IMG_042.jpg
-  Share: nas.local/photos
-  Error: copying file: connection reset by peer
-
-File: /media/sdcard/IMG_043.CR2
-  Share: backup-nas.local/backup
-  Error: creating directories: connection timed out
-```
+macOS metadata files (`._*`, `.DS_Store`, `__MACOSX`) are always skipped.
 
 ---
 
-## 🔧 Supported Photo Formats
+## Performance
 
-- JPEG: `.jpg`, `.jpeg`
-- PNG: `.png`
-- Canon RAW: `.cr2`
-- Nikon RAW: `.nef`
-- Sony RAW: `.arw`
-- Adobe DNG: `.dng`
-- Olympus RAW: `.orf`
-- Panasonic RAW: `.rw2`
-- Generic RAW: `.raw`
+- **Parallel workers** — configurable pool (default 4) transfers multiple files concurrently; increase with `-workers 8` on fast networks
+- **Connection reuse** — one SMB session per share, reused across all files
+- **Directory caching** — date folders are created once and cached; no redundant round-trips
+- **Direct streaming** — files go card → NAS with no local staging
+- **Size verification** — written byte count is compared against the source after every file
 
 ---
 
-## 🛡️ Security Considerations
+## Security
 
-- **Secure Config Storage**: Store `config.yaml` with restricted file permissions (`chmod 600 config.yaml`)
-- **Environment Variables**: Use environment variables for passwords instead of hardcoding them
-- **Version Control**: Avoid committing `config.yaml` with credentials to version control
-- **Git Ignore**: Add config files with sensitive data to `.gitignore`
-- **Network Security**: Ensure SMB traffic is on a trusted network or use encrypted channels
+- `config.yaml` is written with `0600` permissions and is excluded from git
+- Passwords support `${ENV_VAR}` expansion so plaintext secrets stay out of the file
+- The web UI never returns passwords or tokens to the browser; stored secrets are preserved on save if fields are left blank
+- SMB authentication uses NTLM; keep traffic on a trusted LAN or VPN
 
-## 🚀 Performance Tips
+---
 
-- **Worker Count**: Increase `-workers` for faster transfers with high-bandwidth networks (e.g., `-workers 8`)
-- **Network Speed**: Performance is primarily limited by network speed between your machine and NAS
-- **Multiple Shares**: Transfers to multiple SMB shares happen in parallel per file
-- **Directory Caching**: Subsequent files to the same date folder benefit from cached directory creation
-- **Connection Reuse**: All files use the same SMB connection, eliminating authentication overhead
+## Troubleshooting
 
-## 🔧 Troubleshooting
-
-### Connection Issues
-
+**Connection refused / timeout**
 ```bash
-# Test with verbose output and longer timeout
-./snapvault -mount /media/sdcard -name "Test" -timeout 60s
-
-# Verify SMB connectivity manually
-smbclient //nas.local/photos -U photographer
+# Verify SMB is reachable
+nc -zv <nas-ip> 445
+# Try a longer timeout
+./snapvault -serve -timeout 60s
 ```
 
-### Performance Issues
+**Scan times out on large cards**
+The scan preview uses file modification times (not EXIF) so it's fast. If it still times out, check that the mount path is correct and the card is fully mounted.
 
-- Reduce `-workers` if experiencing network congestion
-- Check network bandwidth between machine and NAS
-- Verify NAS isn't under heavy load from other operations
+**Empty folders left on NAS**
+This was caused by macOS `._*` sidecar files being treated as photos — now fixed. The date folder is created before the copy attempt; if the copy fails the folder may remain but will be reused correctly on the next successful transfer to the same date.
 
-### Cancellation
-
-- Press `Ctrl+C` once for graceful shutdown
-- In-flight work is canceled via context and SMB sessions are cleaned up before exit
+**Transfer errors**
+A summary is shown in the web UI and printed to the terminal. Individual file errors don't abort the transfer; all other files continue. Re-running the transfer will re-copy everything (deduplication is not currently implemented).
 
 ---
 
-## 📄 License
+## License
 
-See [LICENSE](LICENSE) file for details.
+See [LICENSE](LICENSE).

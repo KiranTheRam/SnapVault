@@ -33,8 +33,19 @@ type SMBConfig struct {
 	BasePath string `yaml:"base_path"` // Base path within the share
 }
 
+type NtfyConfig struct {
+	Server string `yaml:"server" json:"server"`
+	Topic  string `yaml:"topic" json:"topic"`
+	// Optional auth for protected ntfy servers. Token takes precedence; otherwise
+	// Username/Password are used for HTTP Basic auth. Token supports ${ENV} expansion.
+	Token    string `yaml:"token,omitempty" json:"token"`
+	Username string `yaml:"username,omitempty" json:"username"`
+	Password string `yaml:"password,omitempty" json:"password"`
+}
+
 type Config struct {
 	SMBShares []SMBConfig `yaml:"smb_shares"`
+	Ntfy      *NtfyConfig `yaml:"ntfy,omitempty"`
 }
 
 type SMBConnection struct {
@@ -68,16 +79,33 @@ type MountCandidate struct {
 }
 
 var photoExtensions = map[string]bool{
+	// Stills
 	".jpg":  true,
 	".jpeg": true,
 	".png":  true,
+	".heic": true,
+	".heif": true,
+	".tif":  true,
+	".tiff": true,
 	".cr2":  true,
+	".cr3":  true,
 	".nef":  true,
 	".arw":  true,
 	".dng":  true,
 	".orf":  true,
 	".rw2":  true,
+	".raf":  true,
+	".pef":  true,
+	".srw":  true,
 	".raw":  true,
+	// Video (cameras and action cams)
+	".mov":  true,
+	".mp4":  true,
+	".m4v":  true,
+	".avi":  true,
+	".mts":  true,
+	".m2ts": true,
+	".mxf":  true,
 }
 
 func main() {
@@ -86,7 +114,18 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "Path to SMB config YAML file")
 	timeout := flag.Duration("timeout", 30*time.Second, "SMB connection timeout")
 	workers := flag.Int("workers", 4, "Number of parallel workers for file transfers")
+	serve := flag.Bool("serve", false, "Run the web UI server instead of the terminal app")
+	addr := flag.String("addr", "127.0.0.1:8080", "Address to bind the web UI server")
+	noOpen := flag.Bool("no-open", false, "Do not open the browser automatically in -serve mode")
 	flag.Parse()
+
+	if *serve {
+		if err := runWebServer(*configPath, *addr, *timeout, *workers, !*noOpen); err != nil {
+			slog.Error("Web server failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *mountPoint == "" || *photoshootName == "" {
 		err := runInteractiveTUI(*configPath, *mountPoint, *photoshootName, *timeout, *workers)
@@ -112,6 +151,7 @@ func main() {
 	currentYear := time.Now().Year()
 	folderName := fmt.Sprintf("%d - %s", currentYear, *photoshootName)
 	slog.Info("Starting photo transfer", "folder", folderName, "mount_point", *mountPoint)
+	startedAt := time.Now()
 
 	// Set up context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -133,16 +173,27 @@ func main() {
 	}
 	defer closeConnections(connections)
 
-	// Process photos
-	transferErrors, err := processPhotos(ctx, *mountPoint, folderName, connections, *workers, nil)
+	// Process photos, tracking counts so notifications can report them.
+	var totalCount, completedCount int64
+	countHook := &TransferProgressHook{
+		OnStart: func(total int) { atomic.StoreInt64(&totalCount, int64(total)) },
+		OnProgress: func(total, completed int, _ string) {
+			atomic.StoreInt64(&totalCount, int64(total))
+			atomic.StoreInt64(&completedCount, int64(completed))
+		},
+	}
+	transferErrors, err := processPhotos(ctx, *mountPoint, folderName, connections, *workers, countHook)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			slog.Info("Photo transfer cancelled by user")
 			os.Exit(130)
 		}
+		notifyTransferResult(config.Ntfy, folderName, int(totalCount), int(completedCount), time.Since(startedAt), err, transferErrors)
 		slog.Error("Failed to process photos", "error", err)
 		os.Exit(1)
 	}
+
+	notifyTransferResult(config.Ntfy, folderName, int(totalCount), int(completedCount), time.Since(startedAt), nil, transferErrors)
 
 	// Print summary
 	if len(transferErrors) > 0 {
@@ -561,9 +612,15 @@ func collectTransferJobs(ctx context.Context, mountPoint, folderName string) ([]
 			return nil
 		}
 		if info.IsDir() {
+			if isMacMetadata(info.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
+		if isMacMetadata(info.Name()) {
+			return nil
+		}
 		ext := strings.ToLower(filepath.Ext(path))
 		if !photoExtensions[ext] {
 			return nil
@@ -587,6 +644,65 @@ func collectTransferJobs(ctx context.Context, mountPoint, folderName string) ([]
 	}
 
 	return jobs, nil
+}
+
+type ScanSummary struct {
+	FileCount  int            `json:"fileCount"`
+	TotalBytes int64          `json:"totalBytes"`
+	ByDate     map[string]int `json:"byDate"`
+}
+
+// scanMedia walks a mount point and summarizes the media files that would be
+// transferred, without copying anything. Used by the web UI to preview an SD card.
+//
+// For speed it does NOT open files to read EXIF (that can take minutes over a
+// card reader); the per-day breakdown uses the file modification time, which is
+// an approximation. The actual transfer still groups by precise EXIF capture date.
+func scanMedia(ctx context.Context, mountPoint string) (ScanSummary, error) {
+	summary := ScanSummary{ByDate: make(map[string]int)}
+
+	err := filepath.Walk(mountPoint, func(path string, info os.FileInfo, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if isMacMetadata(info.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if isMacMetadata(info.Name()) {
+			return nil
+		}
+		if !photoExtensions[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+
+		summary.FileCount++
+		summary.TotalBytes += info.Size()
+		summary.ByDate[info.ModTime().Format("2006-01-02")]++
+		return nil
+	})
+	if err != nil {
+		return ScanSummary{}, err
+	}
+
+	return summary, nil
+}
+
+// isMacMetadata reports whether a file is macOS bookkeeping noise that should
+// never be transferred: AppleDouble resource-fork sidecars (._*), Finder
+// metadata (.DS_Store), and the __MACOSX directory tree created by zip.
+func isMacMetadata(name string) bool {
+	return strings.HasPrefix(name, "._") ||
+		name == ".DS_Store" ||
+		name == "__MACOSX"
 }
 
 func getPhotoDate(path string, info os.FileInfo) (time.Time, error) {
@@ -632,8 +748,16 @@ func transferToSMB(ctx context.Context, sourcePath, folderName string, photoDate
 	destPath := filepath.Join(destDir, fileName)
 
 	slog.Info("Copying file to SMB", "source", fileName, "destination", destPath)
-	if err := copyFileToSMB(ctx, sourcePath, conn.Share, destPath); err != nil {
+	written, err := copyFileToSMB(ctx, sourcePath, conn.Share, destPath)
+	if err != nil {
 		return fmt.Errorf("copying file: %w", err)
+	}
+
+	// Verify the destination size matches the source to catch truncated/partial writes.
+	if srcInfo, statErr := os.Stat(sourcePath); statErr == nil {
+		if written != srcInfo.Size() {
+			return fmt.Errorf("size mismatch after copy: wrote %d bytes, source is %d bytes", written, srcInfo.Size())
+		}
 	}
 
 	return nil
@@ -708,7 +832,7 @@ func mkdirAllSMB(ctx context.Context, fs *smb2.Share, path string) error {
 	return nil
 }
 
-func copyFileToSMB(ctx context.Context, sourcePath string, fs *smb2.Share, destPath string) error {
+func copyFileToSMB(ctx context.Context, sourcePath string, fs *smb2.Share, destPath string) (int64, error) {
 	// Use context-aware share
 	fs = fs.WithContext(ctx)
 
@@ -718,22 +842,22 @@ func copyFileToSMB(ctx context.Context, sourcePath string, fs *smb2.Share, destP
 	// Open source file
 	src, err := os.Open(sourcePath)
 	if err != nil {
-		return fmt.Errorf("opening source file: %w", err)
+		return 0, fmt.Errorf("opening source file: %w", err)
 	}
 	defer src.Close()
 
 	// Create destination file on SMB
 	dst, err := fs.Create(destPath)
 	if err != nil {
-		return fmt.Errorf("creating destination file: %w", err)
+		return 0, fmt.Errorf("creating destination file: %w", err)
 	}
 	defer dst.Close()
 
 	// Copy data
-	_, err = io.Copy(dst, src)
+	written, err := io.Copy(dst, src)
 	if err != nil {
-		return fmt.Errorf("copying data: %w", err)
+		return written, fmt.Errorf("copying data: %w", err)
 	}
 
-	return nil
+	return written, nil
 }
